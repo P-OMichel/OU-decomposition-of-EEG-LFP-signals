@@ -78,143 +78,18 @@ def recover_psd_with_model(
     return pred_psd_emp, pred_log_psd_emp, f_grid, pred_log_psd_grid
 
 
-# =====================================================================
-# 3. MAIN SCRIPT
-# =====================================================================
-# if __name__ == "__main__":
-
-#     # --- Load Network ---
-#     CHECKPOINT_PATH = "checkpoints_ha/best_spectral_resnet.pth"
-#     model, device = load_trained_model(CHECKPOINT_PATH)
-
-#     # --- Toggle Data Generation Mode ---
-#     USE_simulated = True  # Set to False for real recorded EEG file
-
-#     if USE_simulated:
-#         print("\n--- Running on Simulated Mixed OU Data ---")
-#         T = 1000  # Signal duration (s)
-#         dt = 0.001
-#         fs = 1 / dt
-
-#         lbda_list = [1, 2, 5]
-#         omega_list = [2 * np.pi * 1, 2 * np.pi * 10, 2 * np.pi * 30]
-#         sigma_list = [3, 2, 50]
-#         factor_list = [1, 1, 0.005]
-
-#         # Generate simulated signal
-#         t, y = get_mixed_OU_signals_exact(
-#             T, dt, lbda_list, omega_list, sigma_list, factor_list
-#         )
-
-#     else:
-#         print("\n--- Running on Real EEG Recording File ---")
-#         file = r"c:\Users\holcman\Documents\GitHub\EEG-labellisation-app---Spectrogram\anesthesia_database\rec_20240321_085300.npy"
-#         fs = 128
-#         y = np.load(file)
-#         y = y[2100 * fs: 2250 * fs] #[0 * fs : 200 * fs]  # Extract 200 second slice
-#         t = np.arange(len(y)) / fs
-
-#     # --- Calculate Empirical PSD via Welch's Method ---
-#     nperseg = int(16 * fs)  # 4-second Welch windows
-#     f_emp, psd_emp = signal.welch(
-#         y, fs=fs, nperseg=nperseg, noverlap=nperseg // 2
-#     )
-
-#     # Restrict evaluation to network range (0.1 to 100 Hz)
-#     freq_mask = (f_emp >= 0.1) & (f_emp <= 45)
-#     f_emp = f_emp[freq_mask]
-#     psd_emp = psd_emp[freq_mask]
-
-#     # --- Run Model Inference ---
-#     pred_psd_emp, pred_log_psd_emp, f_grid, pred_log_psd_grid = (
-#         recover_psd_with_model(model, device, f_emp, psd_emp, target_f_max=45)
-#     )
-
-#     # --- Visualization ---
-#     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-
-#     # Plot 1: Log-Power Domain (What the network operates on)
-#     ax1.plot(
-#         f_emp,
-#         np.log(psd_emp + 1e-12),
-#         color="gray",
-#         alpha=0.6,
-#         linewidth=1.2,
-#         label="Welch PSD (Empirical Input)",
-#     )
-#     ax1.plot(
-#         f_emp,
-#         pred_log_psd_emp,
-#         color="crimson",
-#         linewidth=2.0,
-#         label="Deep Learning Model Recovery",
-#     )
-
-#     if USE_simulated:
-#         # Overlay theoretical/analytical spectrum if using simulated data
-#         f_analytical, psd_analytical = get_analytical_psd(100,
-#             50, lbda_list, omega_list, sigma_list, factor_list
-#         )
-#         ax1.plot(
-#             f_analytical,
-#             np.log(psd_analytical + 1e-12),
-#             color="black",
-#             linestyle="--",
-#             linewidth=1.5,
-#             label="True Analytical PSD",
-#         )
-
-#     ax1.set_ylabel("Log Power (a.u.)")
-#     title_str = (
-#         "Simulated Mixed OU Signals"
-#         if USE_simulated
-#         else "Real Anesthesia EEG Data"
-#     )
-#     ax1.set_title(f"Model Recovery on {title_str} (Log Scale)")
-#     ax1.grid(True, linestyle=":", alpha=0.6)
-#     ax1.legend(loc="upper right")
-
-#     # Plot 2: Linear-Power Domain
-#     ax2.plot(
-#         f_emp, psd_emp, color="gray", alpha=0.6, linewidth=1.2, label="Welch PSD"
-#     )
-#     ax2.plot(
-#         f_emp,
-#         pred_psd_emp,
-#         color="crimson",
-#         linewidth=2.0,
-#         label="DL Model Recovery",
-#     )
-
-#     if USE_simulated:
-#         ax2.plot(
-#             f_analytical,
-#             psd_analytical,
-#             color="black",
-#             linestyle="--",
-#             linewidth=1.5,
-#             label="True Analytical PSD",
-#         )
-
-#     ax2.set_xlabel("Frequency (Hz)")
-#     ax2.set_ylabel("Linear Power")
-#     ax2.set_title(f"Model Recovery on {title_str} (Linear Scale)")
-#     ax2.grid(True, linestyle=":", alpha=0.6)
-#     ax2.legend(loc="upper right")
-
-#     plt.tight_layout()
-#     plt.show()
-
-
 
 if __name__ == "__main__":
 
-    # --- Load Network ---
-    CHECKPOINT_PATH = "checkpoints_ha/best_spectral_resnet.pth"
-    model, device = load_trained_model(CHECKPOINT_PATH)
+    list_checkpoints = [
+        'checkpoints/best_spectral_resnet.pth',
+        'checkpoints_ha_Laplacian/best_spectral_resnet.pth',
+        'checkpoints_ha/best_spectral_resnet.pth',
+        'checkpoints_ha_spectral/best_spectral_resnet.pth'
+    ]
 
     # --- Toggle Settings ---
-    USE_simulated = True  # Set to False for real recorded EEG file
+    USE_simulated = False  # Set to False for real recorded EEG file
     INTERP = False  # True: resample onto standard network grid with buffering | False: feed raw array
 
     if USE_simulated:
@@ -252,63 +127,72 @@ if __name__ == "__main__":
     f_emp = f_emp[freq_mask]
     psd_emp = psd_emp[freq_mask]
 
-    # --- PREPARE INPUT ARRAY (Option B: Frequency Buffering + INTERP Toggle) ---
+    # --- PREPARE INPUT ARRAY ---
     if INTERP:
         buffer_hz = 2.0  # Extend 2 Hz below and above target range to kill edge artifacts
         f_min_buffered = max(0.0, f_emp[0] - buffer_hz)
         f_max_buffered = 45.0 + buffer_hz
 
         # Resample onto 500-point grid with padded frequency bounds
-        f_in = np.linspace(f_min_buffered, f_max_buffered, 500)
+        f_in = np.linspace(f_min_buffered, f_max_buffered, 225)
         log_psd_in = np.interp(f_in, f_emp, np.log(psd_emp + 1e-12))
     else:
         # Pass raw empirical frequency array directly
         f_in = f_emp.copy()
         log_psd_in = np.log(psd_emp + 1e-12)
 
-    # --- Run Model Inference ---
-    # Convert input array to PyTorch Tensor (Batch=1, Channel=1, Length=N)
-    input_tensor = (
-        torch.tensor(log_psd_in, dtype=torch.float32)
-        .unsqueeze(0)
-        .unsqueeze(0)
-        .to(device)
-    )
+    # --- INFERENCE ACROSS ALL CHECKPOINTS ---
+    # Store results for each checkpoint: {label: (pred_log_psd, pred_psd)}
+    predictions = {}
 
-    with torch.no_grad():
-        pred_log_psd_out = model(input_tensor).squeeze().cpu().numpy()
+    for path in list_checkpoints:
+        print(f"Running inference for checkpoint: {path}")
+        model, device = load_trained_model(path)
 
-    # --- POST-PROCESS OUTPUT (Crop Buffer Back to Empirical Grid) ---
-    if INTERP:
-        # Map predictions from buffered grid back onto original f_emp (discards boundary edge artifacts)
-        pred_log_psd_emp = np.interp(f_emp, f_in, pred_log_psd_out)
-    else:
-        pred_log_psd_emp = pred_log_psd_out.copy()
+        input_tensor = (
+            torch.tensor(log_psd_in, dtype=torch.float32)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(device)
+        )
 
-    pred_psd_emp = np.exp(pred_log_psd_emp)
+        with torch.no_grad():
+            pred_log_psd_out = model(input_tensor).squeeze().cpu().numpy()
 
-    # --- Visualization ---
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        # Post-process per checkpoint
+        if INTERP:
+            pred_log_psd_emp = np.interp(f_emp, f_in, pred_log_psd_out)
+        else:
+            pred_log_psd_emp = pred_log_psd_out.copy()
 
-    # Plot 1: Log-Power Domain (What the network operates on)
+        pred_psd_emp = np.exp(pred_log_psd_emp)
+
+        # Create a clean label from folder path or filename
+        model_name = path.split('/')[0] if '/' in path else path
+        predictions[model_name] = (pred_log_psd_emp, pred_psd_emp)
+
+    # --- VISUALIZATION ---
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
+
+    # Ground truth / empirical data base lines
     ax1.plot(
         f_emp,
         np.log(psd_emp + 1e-12),
         color="gray",
-        alpha=0.6,
+        alpha=0.5,
         linewidth=1.2,
         label="Welch PSD (Empirical Input)",
     )
-    ax1.plot(
+    ax2.plot(
         f_emp,
-        pred_log_psd_emp,
-        color="crimson",
-        linewidth=2.0,
-        label="Deep Learning Model Recovery",
+        psd_emp,
+        color="gray",
+        alpha=0.5,
+        linewidth=1.2,
+        label="Welch PSD",
     )
 
     if USE_simulated:
-        # Overlay theoretical/analytical spectrum if using simulated data
         f_analytical, psd_analytical = get_analytical_psd(
             100, 50, lbda_list, omega_list, sigma_list, factor_list
         )
@@ -320,33 +204,6 @@ if __name__ == "__main__":
             linewidth=1.5,
             label="True Analytical PSD",
         )
-
-    ax1.set_ylabel("Log Power (a.u.)")
-    title_str = (
-        "Simulated Mixed OU Signals"
-        if USE_simulated
-        else "Real Anesthesia EEG Data"
-    )
-    interp_str = "Resampled/Buffered Grid" if INTERP else "Raw Direct Array"
-    ax1.set_title(
-        f"Model Recovery on {title_str} ({interp_str} | Log Scale)"
-    )
-    ax1.grid(True, linestyle=":", alpha=0.6)
-    ax1.legend(loc="upper right")
-
-    # Plot 2: Linear-Power Domain
-    ax2.plot(
-        f_emp, psd_emp, color="gray", alpha=0.6, linewidth=1.2, label="Welch PSD"
-    )
-    ax2.plot(
-        f_emp,
-        pred_psd_emp,
-        color="crimson",
-        linewidth=2.0,
-        label="DL Model Recovery",
-    )
-
-    if USE_simulated:
         ax2.plot(
             f_analytical,
             psd_analytical,
@@ -356,13 +213,29 @@ if __name__ == "__main__":
             label="True Analytical PSD",
         )
 
+    # Plot each model prediction
+    colors = plt.cm.tab10(np.linspace(0, 1, len(predictions)))
+
+    for idx, (label, (pred_log_psd, pred_psd)) in enumerate(predictions.items()):
+        color = colors[idx]
+        ax1.semilogx(f_emp, pred_log_psd, color=color, linewidth=1.8, label=f"Model: {label}")
+        ax2.plot(f_emp, pred_psd, color=color, linewidth=1.8, label=f"Model: {label}")
+
+    title_str = "Simulated Mixed OU Signals" if USE_simulated else "Real Anesthesia EEG Data"
+    interp_str = "Resampled/Buffered Grid" if INTERP else "Raw Direct Array"
+
+    # Setup Axes 1 (Log Power)
+    ax1.set_ylabel("Log Power (a.u.)")
+    ax1.set_title(f"Checkpoint Comparison on {title_str} ({interp_str} | Log Scale)")
+    ax1.grid(True, linestyle=":", alpha=0.6)
+    ax1.legend(loc="upper right", fontsize="small")
+
+    # Setup Axes 2 (Linear Power)
     ax2.set_xlabel("Frequency (Hz)")
     ax2.set_ylabel("Linear Power")
-    ax2.set_title(
-        f"Model Recovery on {title_str} ({interp_str} | Linear Scale)"
-    )
+    ax2.set_title(f"Checkpoint Comparison on {title_str} ({interp_str} | Linear Scale)")
     ax2.grid(True, linestyle=":", alpha=0.6)
-    ax2.legend(loc="upper right")
+    ax2.legend(loc="upper right", fontsize="small")
 
     plt.tight_layout()
     plt.show()
