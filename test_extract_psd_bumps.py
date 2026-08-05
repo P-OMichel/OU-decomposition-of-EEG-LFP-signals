@@ -17,7 +17,10 @@ def load_psd_sample(filepath="psd_dataset_splits_high_amplitude.npz", split="tra
     f = data["f"]
     log_noisy = data[f"log_noisy_{split}"][sample_idx]
     log_clean = data[f"log_clean_{split}"][sample_idx]
-    meta = data[f"metadata_{split}"][sample_idx]
+    try:
+        meta = data[f"metadata_{split}"][sample_idx]
+    except:
+        meta = None
 
     f0_list = [peak["f0"] for peak in meta.get("peaks", [])]
 
@@ -250,7 +253,7 @@ def extract_intervals_method2_direct_psd(
 if __name__ == "__main__":
     filepath = "psd_dataset_splits_high_amplitude.npz"
     split = "train"
-    sample_idx = 2 # 4 to visualize effect on asymetric peak
+    sample_idx = 12 # 4 to visualize effect on asymetric peak
 
     # 1. Load data
     f, log_noisy, log_clean, f0_list, meta = load_psd_sample(

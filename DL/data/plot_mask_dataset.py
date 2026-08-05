@@ -101,7 +101,7 @@ if __name__ == "__main__":
         print(f" - Mask Array Shape     : {masks_train.shape}")
         
         # 2. Plot the first 3 samples
-        for i in range(3):
+        for i in range(12,13):
             plot_psd_mask_sample(
                 f=f,
                 log_noisy=log_noisy_train[i],
