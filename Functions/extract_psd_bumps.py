@@ -109,3 +109,89 @@ def extract_intervals_method1_detrended_seed(
         })
 
     return intervals_info
+
+
+# =====================================================================
+# METHOD 2: DIRECT LINEAR-SPACE PSD BOUNDARY EXTRACTION
+# =====================================================================
+def extract_intervals_method2_direct_psd(
+    f, y_log, f0_list, max_high_ratio=0.05, min_boundary_ratio=0.5
+):
+    if len(f0_list) == 0:
+        return []
+
+    sorted_f0 = sorted(f0_list)
+    n_peaks = len(sorted_f0)
+    intervals_info = []
+
+    midpoints = [(sorted_f0[i] + sorted_f0[i + 1]) / 2.0 for i in range(n_peaks - 1)]
+    f_min, f_max = f[0], f[-1]
+    bounds = []
+
+    for i in range(n_peaks):
+        left = f_min if i == 0 else midpoints[i - 1]
+        right = f_max if i == n_peaks - 1 else midpoints[i]
+        bounds.append((left, right))
+
+    for i, (left_f, right_f) in enumerate(bounds):
+        target_f0 = sorted_f0[i]
+        idx = np.where((f >= left_f) & (f <= right_f))[0]
+        if len(idx) < 4:
+            continue
+
+        sub_f = f[idx]
+        sub_y_log = y_log[idx]
+
+        # --- CRITICAL: Convert to Linear Power Scale ---
+        psd_lin = np.exp(sub_y_log)
+
+        # Peak index closest to target f0
+        best_p = np.argmin(np.abs(sub_f - target_f0))
+        p_max_lin = psd_lin[best_p]
+
+        # Initial search starts at segment boundaries
+        l_idx = 0
+        r_idx = len(sub_f) - 1
+
+        high_side = "left" if psd_lin[l_idx] >= psd_lin[r_idx] else "right"
+
+        # --- CONDITION 1: Push higher edge to >= (max_high_ratio * P_peak) ---
+        high_target_lin = max_high_ratio * p_max_lin
+
+        if high_side == "left":
+            while l_idx < best_p and psd_lin[l_idx] < high_target_lin:
+                l_idx += 1
+            val_high_lin = psd_lin[l_idx]
+        else:
+            while r_idx > best_p and psd_lin[r_idx] < high_target_lin:
+                r_idx -= 1
+            val_high_lin = psd_lin[r_idx]
+
+        # --- CONDITION 2: Ensure lower edge >= (min_boundary_ratio * P_high) ---
+        low_target_lin = min_boundary_ratio * val_high_lin
+
+        if high_side == "right":
+            while l_idx < best_p and psd_lin[l_idx] < low_target_lin:
+                if l_idx + 1 < best_p and psd_lin[l_idx + 1] > val_high_lin:
+                    break
+                l_idx += 1
+        else:
+            while r_idx > best_p and psd_lin[r_idx] < low_target_lin:
+                if r_idx - 1 > best_p and psd_lin[r_idx - 1] > val_high_lin:
+                    break
+                r_idx -= 1
+
+        left_edge_f = sub_f[l_idx]
+        right_edge_f = sub_f[r_idx]
+
+        intervals_info.append({
+            "peak_idx": i,
+            "f0": target_f0,
+            "sub_f": sub_f,
+            "sub_y_log": sub_y_log,
+            "segment_bounds": (left_f, right_f),
+            "peak_edges": (left_edge_f, right_edge_f),
+            "edge_indices": (l_idx, r_idx)
+        })
+
+    return intervals_info

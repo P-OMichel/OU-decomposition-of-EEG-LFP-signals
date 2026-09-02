@@ -40,7 +40,7 @@ else:
 
     fs = 128
     y = np.load(file)
-    y = y[0 * fs: 200 * fs]  #[0 * fs: 200 * fs] #[2100 * fs: 2250 * fs]
+    y = y[2100 * fs: 2250 * fs]  #[0 * fs: 200 * fs] #[2100 * fs: 2250 * fs]
     t = np.arange(len(y)) / fs
 
 # --- Get PSD

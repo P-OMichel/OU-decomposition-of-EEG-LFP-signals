@@ -32,6 +32,8 @@ f_psd, psd = signal.welch(y, fs=fs, nperseg=int(fs * 16))
 fit_mask = (f_psd > 0) & (f_psd < 45.0)
 freqs = f_psd[fit_mask]
 pxx = psd[fit_mask]
+
+pxx = np.log(pxx + 1e-12)
 # -------------------------------------------------------------
 # Method 1: Savitzky-Golay Filter (Recommended for PSD)
 # -------------------------------------------------------------
@@ -58,9 +60,9 @@ pxx_lowpass = signal.filtfilt(b, a, pxx)
 # Visualization
 # -------------------------------------------------------------
 plt.figure(figsize=(10, 5))
-plt.semilogy(freqs, pxx, alpha=0.4, label='Original PSD (Welch)')
-plt.semilogy(freqs, pxx_savgol, label='Savitzky-Golay Filter', linewidth=2)
-plt.semilogy(freqs, pxx_lowpass, '--', label='Butterworth Low-Pass', linewidth=2)
+plt.plot(freqs, pxx, alpha=0.4, label='Original PSD (Welch)')
+plt.plot(freqs, pxx_savgol, label='Savitzky-Golay Filter', linewidth=2)
+plt.plot(freqs, pxx_lowpass, '--', label='Butterworth Low-Pass', linewidth=2)
 
 plt.xlabel('Frequency [Hz]')
 plt.ylabel('PSD [V**2/Hz]')
