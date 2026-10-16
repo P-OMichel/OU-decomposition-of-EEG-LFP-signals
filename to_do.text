@@ -1,0 +1,5 @@
+evaluate comparison with various level of noise.
+100 samples each time for 10 different level of noise.
+
+train model on linear  psd  then sum then log and on log psd then sum
+See in those two cotnext when should noise be added.
