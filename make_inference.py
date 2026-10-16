@@ -356,7 +356,7 @@ def load_keypoint_model(checkpoint_path="best_keypoint_res_unet_cascade.pth", ba
 
 
 if __name__ == "__main__":
-    CHECKPOINT_PATH = "best_keypoint_res_unet.pth"
+    CHECKPOINT_PATH = "best_keypoint.pth"
 
     # --- Settings ---
     USE_SIMULATED = True   # Toggle False for real EEG recording

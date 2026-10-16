@@ -81,7 +81,7 @@ def plot_psd_mask_sample(f, log_noisy, log_clean, center_mask, interval_mask, sa
 # 4. EXECUTION / VISUALIZATION DEMO
 # =====================================================================
 if __name__ == "__main__":
-    DATASET_PATH = "eeg_psd_benchmark.npz"
+    DATASET_PATH = "eeg_psd_benchmark_fooof_advantage.npz" # eeg_psd_benchmark.npz
 
 
     # Step 2: Load and plot directly from the single flat arrays
