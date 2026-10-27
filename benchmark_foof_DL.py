@@ -1,6 +1,6 @@
 """
 Unified head-to-head multi-noise benchmark comparing ResMultiTaskUNet1D against FOOOF
-across progressive noise tiers (decreasing Welch segments K).
+across progressive noise tiers (decreasing Welch segments K), with Sub-Bin Peak Refinement.
 """
 
 import os
@@ -11,135 +11,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from fooof import FOOOF
+from DL.models.models import ResMultiTaskUNet1D, DeformResMultiTaskUNet1D, TokenResMultiTaskUNet1D
 
 
 # =====================================================================
-# 1. MODEL ARCHITECTURE
+# 1. HELPER FUNCTIONS WITH SUB-BIN PARABOLIC REFINEMENT
 # =====================================================================
-class SqueezeExcitation1D(nn.Module):
-    def __init__(self, channels, reduction=4):
-        super().__init__()
-        mid_c = max(channels // reduction, 4)
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Conv1d(channels, mid_c, kernel_size=1),
-            nn.GELU(),
-            nn.Conv1d(mid_c, channels, kernel_size=1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        return x * self.fc(x)
-
-
-class ResConvBlock1D(nn.Module):
-    def __init__(self, in_c, out_c, kernel_size=3, padding=1, dilation=1, drop_prob=0.1, use_se=True):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv1d(in_c, out_c, kernel_size=kernel_size, padding=padding, dilation=dilation),
-            nn.BatchNorm1d(out_c),
-            nn.GELU(),
-            nn.Dropout1d(p=drop_prob),
-            nn.Conv1d(out_c, out_c, kernel_size=kernel_size, padding=padding, dilation=dilation),
-            nn.BatchNorm1d(out_c),
-        )
-        self.se = SqueezeExcitation1D(out_c) if use_se else nn.Identity()
-        self.shortcut = nn.Conv1d(in_c, out_c, kernel_size=1) if in_c != out_c else nn.Identity()
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        return self.act(self.se(self.block(x)) + self.shortcut(x))
-
-
-class ASPP1D(nn.Module):
-    def __init__(self, in_c, out_c):
-        super().__init__()
-        branch_c = out_c // 4
-        self.b0 = nn.Sequential(nn.Conv1d(in_c, branch_c, 1), nn.BatchNorm1d(branch_c), nn.GELU())
-        self.b1 = nn.Sequential(nn.Conv1d(in_c, branch_c, 3, padding=2, dilation=2), nn.BatchNorm1d(branch_c), nn.GELU())
-        self.b2 = nn.Sequential(nn.Conv1d(in_c, branch_c, 3, padding=4, dilation=4), nn.BatchNorm1d(branch_c), nn.GELU())
-        self.b3 = nn.Sequential(nn.Conv1d(in_c, branch_c, 3, padding=8, dilation=8), nn.BatchNorm1d(branch_c), nn.GELU())
-        self.project = nn.Sequential(nn.Conv1d(branch_c * 4, out_c, 1), nn.BatchNorm1d(out_c), nn.GELU())
-
-    def forward(self, x):
-        feat = torch.cat([self.b0(x), self.b1(x), self.b2(x), self.b3(x)], dim=1)
-        return self.project(feat)
-
-
-class ResMultiTaskUNet1D(nn.Module):
-    def __init__(self, in_channels=1, base_filters=32):
-        super().__init__()
-        self.enc1 = ResConvBlock1D(in_channels, base_filters, use_se=True)
-        self.pool1 = nn.MaxPool1d(2)
-        self.enc2 = ResConvBlock1D(base_filters, base_filters * 2, use_se=True)
-        self.pool2 = nn.MaxPool1d(2)
-        self.enc3 = ResConvBlock1D(base_filters * 2, base_filters * 4, use_se=True)
-        self.aspp = ASPP1D(base_filters * 4, base_filters * 4)
-
-        self.up2 = nn.ConvTranspose1d(base_filters * 4, base_filters * 2, kernel_size=2, stride=2)
-        self.dec2 = ResConvBlock1D(base_filters * 4, base_filters * 2, use_se=True)
-        self.up1 = nn.ConvTranspose1d(base_filters * 2, base_filters, kernel_size=2, stride=2)
-        self.dec1 = ResConvBlock1D(base_filters * 2, base_filters, use_se=True)
-
-        head_mid_c = base_filters // 2
-        self.denoise_feat = nn.Sequential(
-            nn.Conv1d(base_filters, head_mid_c, kernel_size=3, padding=1),
-            nn.BatchNorm1d(head_mid_c),
-            nn.GELU(),
-            nn.Dropout1d(p=0.1),
-        )
-        self.denoise_out = nn.Conv1d(head_mid_c, 1, kernel_size=1)
-
-        self.heatmap_feat = nn.Sequential(
-            nn.Conv1d(base_filters + head_mid_c, head_mid_c, kernel_size=3, padding=1),
-            nn.BatchNorm1d(head_mid_c),
-            nn.GELU(),
-            nn.Dropout1d(p=0.1),
-        )
-        self.heatmap_out = nn.Conv1d(head_mid_c, 1, kernel_size=1)
-
-        self.width_feat = nn.Sequential(
-            nn.Conv1d(base_filters + head_mid_c + 1, head_mid_c, kernel_size=3, padding=1),
-            nn.BatchNorm1d(head_mid_c),
-            nn.GELU(),
-            nn.Dropout1d(p=0.1),
-        )
-        self.width_out = nn.Sequential(nn.Conv1d(head_mid_c, 2, kernel_size=1), nn.Softplus())
-
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        e3 = self.enc3(self.pool2(e2))
-        e3 = self.aspp(e3)
-
-        d2 = self.up2(e3)
-        if d2.shape[-1] != e2.shape[-1]:
-            d2 = F.interpolate(d2, size=e2.shape[-1], mode="linear", align_corners=False)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
-
-        d1 = self.up1(d2)
-        if d1.shape[-1] != e1.shape[-1]:
-            d1 = F.interpolate(d1, size=e1.shape[-1], mode="linear", align_corners=False)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
-
-        f_denoise = self.denoise_feat(d1)
-        noise_residual = self.denoise_out(f_denoise)
-        clean_psd = x - noise_residual
-
-        f_heat = self.heatmap_feat(torch.cat([d1, f_denoise], dim=1))
-        heatmap_logits = self.heatmap_out(f_heat)
-
-        peak_prob = torch.sigmoid(heatmap_logits)
-        f_width = self.width_feat(torch.cat([d1, f_denoise, peak_prob], dim=1))
-        widths = self.width_out(f_width)
-
-        return clean_psd, heatmap_logits, widths
-
-
-# =====================================================================
-# 2. HELPER FUNCTIONS
-# =====================================================================
-def decode_peak_frequencies(pred_logits, f_grid, center_thresh=0.35, kernel_size=5):
+def decode_peak_frequencies_subbin(pred_logits, f_grid, center_thresh=0.35, kernel_size=5):
+    """
+    Decodes peak centers using 1D local NMS, then applies 3-point parabolic
+    sub-bin interpolation on the heatmap response to achieve sub-grid precision.
+    """
     if pred_logits.ndim == 1:
         pred_logits = pred_logits.unsqueeze(0).unsqueeze(0)
     elif pred_logits.ndim == 2:
@@ -152,11 +34,40 @@ def decode_peak_frequencies(pred_logits, f_grid, center_thresh=0.35, kernel_size
 
     peak_indices = torch.nonzero(keep.squeeze()).squeeze(-1)
     if peak_indices.numel() == 0:
-        return np.array([])
+        return np.array([], dtype=np.float64)
     if peak_indices.ndim == 0:
         peak_indices = peak_indices.unsqueeze(0)
 
-    return f_grid[peak_indices.detach().cpu().numpy()]
+    indices = peak_indices.detach().cpu().numpy()
+    prob_1d = heatmap_prob.squeeze().detach().cpu().numpy()
+    n_bins = len(f_grid)
+
+    refined_peaks = []
+    for idx in indices:
+        # Check boundary condition for 3-point neighborhood
+        if 0 < idx < n_bins - 1:
+            y_left = prob_1d[idx - 1]
+            y_center = prob_1d[idx]
+            y_right = prob_1d[idx + 1]
+
+            # Parabolic vertex displacement delta in bins
+            denom = 2.0 * (y_left - 2.0 * y_center + y_right)
+            if abs(denom) > 1e-6:
+                delta = (y_left - y_right) / denom
+                # Clamp delta to [-0.5, 0.5] bin space
+                delta = np.clip(delta, -0.5, 0.5)
+            else:
+                delta = 0.0
+
+            # Grid step size around the local maximum
+            df = 0.5 * (f_grid[idx + 1] - f_grid[idx - 1])
+            refined_freq = f_grid[idx] + delta * df
+        else:
+            refined_freq = f_grid[idx]
+
+        refined_peaks.append(refined_freq)
+
+    return np.array(refined_peaks, dtype=np.float64)
 
 
 def match_peaks_and_compute_errors(pred_peaks, gt_peaks, max_dist_hz=2.0):
@@ -195,8 +106,9 @@ def match_peaks_and_compute_errors(pred_peaks, gt_peaks, max_dist_hz=2.0):
 # 3. MULTI-NOISE JOINT BENCHMARK LOOP
 # =====================================================================
 def run_multinoise_joint_benchmark(
-    dataset_path="eeg_psd_multinoise_benchmark.npz",
-    checkpoint_path="best_keypoint_se_cascade.pth",
+    model,
+    dataset_path="DL/data/eeg_psd_multinoise_benchmark_foof_advantage.npz",
+    checkpoint_path="DL_checkpoints/Baseline_UNet.pth",
     batch_size=64,
     center_thresh=0.35,
     max_match_dist=2.0,
@@ -208,9 +120,9 @@ def run_multinoise_joint_benchmark(
     fooof_threshold=2.5,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    print(f'checkpoint: {checkpoint_path}')
     # Load DL Model
-    model = ResMultiTaskUNet1D(in_channels=1, base_filters=32).to(device)
+    model.to(device)
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
         state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
@@ -237,14 +149,13 @@ def run_multinoise_joint_benchmark(
     freq_mask = (f_fooof >= freq_range[0]) & (f_fooof <= freq_range[1])
 
     print(f"Benchmarking {n_samples} samples across {n_levels} noise levels (Welch K = {list(k_levels)})...")
+    print("Using Sub-Bin Parabolic Refinement for UNet peak centers.")
 
-    # Metric containers across noise levels
     results = {
         "dl": {"f1": [], "mae_pos": [], "rmse_recon": []},
         "fooof": {"f1": [], "mae_pos": [], "rmse_recon": []},
     }
 
-    # Tracking storage for the top visual panel
     sample_vis_idx = 0
     vis_data = {
         "f_eval": f_fooof[freq_mask],
@@ -260,7 +171,6 @@ def run_multinoise_joint_benchmark(
     for lvl_idx, k_val in enumerate(k_levels):
         print(f"\nEvaluating Noise Level {lvl_idx + 1}/{n_levels} (Welch K = {k_val})...")
 
-        # Re-initialize FOOOF per noise level
         fm = FOOOF(
             aperiodic_mode=fooof_aperiodic,
             peak_width_limits=fooof_peak_width,
@@ -275,7 +185,7 @@ def run_multinoise_joint_benchmark(
         dl_abs_errors, fooof_abs_errors = [], []
         dl_spec_rmse, fooof_spec_rmse = [], []
 
-        # 1. Run UNet in Batches
+        # 1. Batched UNet Inference
         dl_clean_preds = []
         dl_pred_peaks_list = []
 
@@ -290,7 +200,8 @@ def run_multinoise_joint_benchmark(
                 dl_clean_preds.extend(c_preds.squeeze(1).cpu().numpy())
 
             for b in range(end_idx - start_idx):
-                p_f = decode_peak_frequencies(batch_logits[b, 0], f_fooof, center_thresh=center_thresh)
+                # Apply Sub-Bin Refinement
+                p_f = decode_peak_frequencies_subbin(batch_logits[b, 0], f_fooof, center_thresh=center_thresh)
                 p_f = p_f[(p_f >= freq_range[0]) & (p_f <= freq_range[1])]
                 dl_pred_peaks_list.append(p_f)
 
@@ -335,7 +246,6 @@ def run_multinoise_joint_benchmark(
                 fooof_curve_ln = log_noisy_all[i, lvl_idx][freq_mask]
                 fooof_spec_rmse.append(np.nan)
 
-            # Save curves for top visualization
             if i == sample_vis_idx:
                 if lvl_idx == 0:
                     vis_data["dl_low"] = unet_curve
@@ -365,7 +275,7 @@ def run_multinoise_joint_benchmark(
         print(f"Noise K={k_val:2d} | FOOOF -> F1: {f1_f:.3f} | MAE: {results['fooof']['mae_pos'][-1]:.3f} Hz | RMSE: {results['fooof']['rmse_recon'][-1]:.4f}")
 
     # =====================================================================
-    # 4. COMPREHENSIVE FIGURE: RECONSTRUCTION EXAMPLES + NOISE TRENDS
+    # 4. COMPREHENSIVE FIGURE
     # =====================================================================
     fig = plt.figure(figsize=(16, 10))
     gs = fig.add_gridspec(2, 3, height_ratios=[1.1, 1.0], hspace=0.32, wspace=0.25)
@@ -413,7 +323,7 @@ def run_multinoise_joint_benchmark(
 
     # 2. Peak Center Error MAE vs Noise
     ax_b2 = fig.add_subplot(gs[1, 1])
-    ax_b2.plot(x_indices, results["dl"]["mae_pos"], "o-", color="royalblue", lw=2, ms=6, label="UNet Model")
+    ax_b2.plot(x_indices, results["dl"]["mae_pos"], "o-", color="royalblue", lw=2, ms=6, label="UNet (Sub-Bin Refined)")
     ax_b2.plot(x_indices, results["fooof"]["mae_pos"], "s--", color="forestgreen", lw=2, ms=6, label="FOOOF")
     ax_b2.set_xticks(x_indices)
     ax_b2.set_xticklabels(noise_labels)
@@ -441,8 +351,13 @@ def run_multinoise_joint_benchmark(
 
 if __name__ == "__main__":
     run_multinoise_joint_benchmark(
-        dataset_path="eeg_psd_multinoise_benchmark_foof_advantage.npz",
-        checkpoint_path="best_keypoint_se_cascade.pth",
+        #model = ResMultiTaskUNet1D(in_channels=1, base_filters=32),
+        model = DeformResMultiTaskUNet1D(in_channels=1, base_filters=32),
+        #model = TokenResMultiTaskUNet1D(in_channels=1, base_filters=32),
+        dataset_path="DL/data/eeg_psd_multinoise_benchmark_foof_advantage.npz",
+        #checkpoint_path="DL_checkpoints/Baseline_UNet.pth",
+        checkpoint_path="DL_checkpoints/Deformable_UNet.pth",
+        #checkpoint_path="DL_checkpoints/TaskToken_UNet.pth",
         batch_size=64,
         center_thresh=0.35,
         max_match_dist=2.0,
@@ -453,4 +368,3 @@ if __name__ == "__main__":
         fooof_min_height=0.25,
         fooof_threshold=2.5,
     )
-

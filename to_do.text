@@ -3,3 +3,5 @@ evaluate comparison with various level of noise.
 
 train model on linear  psd  then sum then log and on log psd then sum
 See in those two cotnext when should noise be added.
+
+accentuate on the anchor free framework. here no box around peak are used for detection but a center net approach instead.
