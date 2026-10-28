@@ -303,7 +303,7 @@ if __name__ == "__main__":
         #model = TokenResMultiTaskUNet1D(in_channels=1, base_filters=32),
         dataset_path="DL/data/eeg_psd_multinoise_benchmark_foof_advantage.npz",
         #checkpoint_path="DL_checkpoints/Baseline_UNet.pth",
-        checkpoint_path="DL_checkpoints/Deformable_UNet.pth",
+        checkpoint_path="DL_checkpoints/Deformable_UNet(3).pth",
         #checkpoint_path="DL_checkpoints/TaskToken_UNet.pth",
         batch_size=64,
         center_thresh=0.35,

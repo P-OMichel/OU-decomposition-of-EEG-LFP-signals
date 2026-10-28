@@ -1,8 +1,6 @@
 """
-Unified head-to-head benchmark comparing ResMultiTaskUNet1D against FOOOF
-on:
-  1. Peak localization (Absolute Error) and count estimation
-  2. Full spectral reconstruction error against ground-truth clean PSD (log_clean)
+Unified head-to-head multi-noise benchmark comparing ResMultiTaskUNet1D against FOOOF
+using identical frequency grids.
 """
 
 import os
@@ -14,196 +12,126 @@ import torch.nn as nn
 import torch.nn.functional as F
 from fooof import FOOOF
 
-
-# =====================================================================
-# 1. MODEL ARCHITECTURE
-# =====================================================================
-class SqueezeExcitation1D(nn.Module):
-    def __init__(self, channels, reduction=4):
-        super().__init__()
-        mid_c = max(channels // reduction, 4)
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Conv1d(channels, mid_c, kernel_size=1),
-            nn.GELU(),
-            nn.Conv1d(mid_c, channels, kernel_size=1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        return x * self.fc(x)
-
-
-class ResConvBlock1D(nn.Module):
-    def __init__(self, in_c, out_c, kernel_size=3, padding=1, dilation=1, drop_prob=0.1, use_se=True):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv1d(in_c, out_c, kernel_size=kernel_size, padding=padding, dilation=dilation),
-            nn.BatchNorm1d(out_c),
-            nn.GELU(),
-            nn.Dropout1d(p=drop_prob),
-            nn.Conv1d(out_c, out_c, kernel_size=kernel_size, padding=padding, dilation=dilation),
-            nn.BatchNorm1d(out_c),
-        )
-        self.se = SqueezeExcitation1D(out_c) if use_se else nn.Identity()
-        self.shortcut = nn.Conv1d(in_c, out_c, kernel_size=1) if in_c != out_c else nn.Identity()
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        out = self.se(self.block(x))
-        return self.act(out + self.shortcut(x))
-
-
-class ASPP1D(nn.Module):
-    def __init__(self, in_c, out_c):
-        super().__init__()
-        branch_c = out_c // 4
-        self.b0 = nn.Sequential(nn.Conv1d(in_c, branch_c, 1), nn.BatchNorm1d(branch_c), nn.GELU())
-        self.b1 = nn.Sequential(nn.Conv1d(in_c, branch_c, 3, padding=2, dilation=2), nn.BatchNorm1d(branch_c), nn.GELU())
-        self.b2 = nn.Sequential(nn.Conv1d(in_c, branch_c, 3, padding=4, dilation=4), nn.BatchNorm1d(branch_c), nn.GELU())
-        self.b3 = nn.Sequential(nn.Conv1d(in_c, branch_c, 3, padding=8, dilation=8), nn.BatchNorm1d(branch_c), nn.GELU())
-        self.project = nn.Sequential(nn.Conv1d(branch_c * 4, out_c, 1), nn.BatchNorm1d(out_c), nn.GELU())
-
-    def forward(self, x):
-        feat = torch.cat([self.b0(x), self.b1(x), self.b2(x), self.b3(x)], dim=1)
-        return self.project(feat)
-
-
-class ResMultiTaskUNet1D(nn.Module):
-    def __init__(self, in_channels=1, base_filters=32):
-        super().__init__()
-        self.enc1 = ResConvBlock1D(in_channels, base_filters, use_se=True)
-        self.pool1 = nn.MaxPool1d(2)
-        self.enc2 = ResConvBlock1D(base_filters, base_filters * 2, use_se=True)
-        self.pool2 = nn.MaxPool1d(2)
-        self.enc3 = ResConvBlock1D(base_filters * 2, base_filters * 4, use_se=True)
-        self.aspp = ASPP1D(base_filters * 4, base_filters * 4)
-
-        self.up2 = nn.ConvTranspose1d(base_filters * 4, base_filters * 2, kernel_size=2, stride=2)
-        self.dec2 = ResConvBlock1D(base_filters * 4, base_filters * 2, use_se=True)
-        self.up1 = nn.ConvTranspose1d(base_filters * 2, base_filters, kernel_size=2, stride=2)
-        self.dec1 = ResConvBlock1D(base_filters * 2, base_filters, use_se=True)
-
-        head_mid_c = base_filters // 2
-        self.denoise_feat = nn.Sequential(
-            nn.Conv1d(base_filters, head_mid_c, kernel_size=3, padding=1),
-            nn.BatchNorm1d(head_mid_c),
-            nn.GELU(),
-            nn.Dropout1d(p=0.1),
-        )
-        self.denoise_out = nn.Conv1d(head_mid_c, 1, kernel_size=1)
-
-        self.heatmap_feat = nn.Sequential(
-            nn.Conv1d(base_filters + head_mid_c, head_mid_c, kernel_size=3, padding=1),
-            nn.BatchNorm1d(head_mid_c),
-            nn.GELU(),
-            nn.Dropout1d(p=0.1),
-        )
-        self.heatmap_out = nn.Conv1d(head_mid_c, 1, kernel_size=1)
-
-        self.width_feat = nn.Sequential(
-            nn.Conv1d(base_filters + head_mid_c + 1, head_mid_c, kernel_size=3, padding=1),
-            nn.BatchNorm1d(head_mid_c),
-            nn.GELU(),
-            nn.Dropout1d(p=0.1),
-        )
-        self.width_out = nn.Sequential(nn.Conv1d(head_mid_c, 2, kernel_size=1), nn.Softplus())
-
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        e3 = self.enc3(self.pool2(e2))
-        e3 = self.aspp(e3)
-
-        d2 = self.up2(e3)
-        if d2.shape[-1] != e2.shape[-1]:
-            d2 = F.interpolate(d2, size=e2.shape[-1], mode="linear", align_corners=False)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
-
-        d1 = self.up1(d2)
-        if d1.shape[-1] != e1.shape[-1]:
-            d1 = F.interpolate(d1, size=e1.shape[-1], mode="linear", align_corners=False)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
-
-        f_denoise = self.denoise_feat(d1)
-        noise_residual = self.denoise_out(f_denoise)
-        clean_psd = x - noise_residual
-
-        f_heat = self.heatmap_feat(torch.cat([d1, f_denoise], dim=1))
-        heatmap_logits = self.heatmap_out(f_heat)
-
-        peak_prob = torch.sigmoid(heatmap_logits)
-        f_width = self.width_feat(torch.cat([d1, f_denoise, peak_prob], dim=1))
-        widths = self.width_out(f_width)
-
-        return clean_psd, heatmap_logits, widths
+from DL.models.models import (
+    ResMultiTaskUNet1D,
+    DeformResMultiTaskUNet1D,
+    TokenResMultiTaskUNet1D,
+)
+from Inference.helpers import decode_peak_frequencies_subbin
 
 
 # =====================================================================
-# 2. HELPER FUNCTIONS
+# 1. HELPER FUNCTIONS
 # =====================================================================
-def decode_peak_frequencies(pred_logits, f_grid, center_thresh=0.35, kernel_size=5):
-    if pred_logits.ndim == 1:
-        pred_logits = pred_logits.unsqueeze(0).unsqueeze(0)
-    elif pred_logits.ndim == 2:
-        pred_logits = pred_logits.unsqueeze(0)
-
-    heatmap_prob = torch.sigmoid(pred_logits)
-    pad = (kernel_size - 1) // 2
-    hmax = F.max_pool1d(heatmap_prob, kernel_size=kernel_size, stride=1, padding=pad)
-    keep = (heatmap_prob == hmax) & (heatmap_prob >= center_thresh)
-
-    peak_indices = torch.nonzero(keep.squeeze()).squeeze(-1)
-    if peak_indices.numel() == 0:
-        return np.array([])
-    if peak_indices.ndim == 0:
-        peak_indices = peak_indices.unsqueeze(0)
-
-    return f_grid[peak_indices.detach().cpu().numpy()]
-
-
 def match_peaks_and_compute_errors(pred_peaks, gt_peaks, max_dist_hz=2.0):
-    n_p = len(pred_peaks)
-    n_g = len(gt_peaks)
+    pred_peaks = np.asarray(pred_peaks, dtype=np.float64)
+    gt_peaks = np.asarray(gt_peaks, dtype=np.float64)
 
+    n_p, n_g = len(pred_peaks), len(gt_peaks)
     if n_p == 0 and n_g == 0:
-        return [], 0, 0, 0
+        return [], [], 0, 0, 0
     if n_p == 0:
-        return [], 0, 0, n_g
+        return [], [], 0, 0, n_g
     if n_g == 0:
-        return [], 0, n_p, 0
+        return [], [], 0, n_p, 0
 
     dist_matrix = np.abs(pred_peaks[:, None] - gt_peaks[None, :])
     pred_idx, gt_idx = linear_sum_assignment(dist_matrix)
 
-    abs_errors = []
-    matched_p = set()
-    matched_g = set()
+    abs_errors, signed_errors = [], []
+    matched_p, matched_g = set(), set()
 
     for p, g in zip(pred_idx, gt_idx):
-        err = abs(pred_peaks[p] - gt_peaks[g])
-        if err <= max_dist_hz:
-            abs_errors.append(err)
+        signed_err = pred_peaks[p] - gt_peaks[g]
+        abs_err = abs(signed_err)
+        if abs_err <= max_dist_hz:
+            abs_errors.append(abs_err)
+            signed_errors.append(signed_err)
             matched_p.add(p)
             matched_g.add(g)
 
     tp = len(matched_p)
     fp = n_p - tp
     fn = n_g - len(matched_g)
+    return abs_errors, signed_errors, tp, fp, fn
 
-    return abs_errors, tp, fp, fn
+
+def plot_head_to_head_error_distributions(
+    dl_abs, dl_signed, fooof_abs, fooof_signed, max_dist_hz=2.0, bins=40
+):
+    dl_abs, dl_signed = np.array(dl_abs), np.array(dl_signed)
+    fooof_abs, fooof_signed = np.array(fooof_abs), np.array(fooof_signed)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # UNet Signed
+    if len(dl_signed) > 0:
+        axes[0, 0].hist(dl_signed, bins=bins, range=(-max_dist_hz, max_dist_hz),
+                        color="royalblue", edgecolor="black", alpha=0.7, density=True)
+        mean_u, std_u = np.mean(dl_signed), np.std(dl_signed)
+        axes[0, 0].axvline(0, color="red", linestyle="--", lw=1.5, label="Zero Bias")
+        axes[0, 0].axvline(mean_u, color="darkorange", lw=1.8, label=f"Mean: {mean_u:+.3f} Hz")
+        axes[0, 0].set_title(f"UNet Signed Error ($f_{{pred}} - f_{{gt}}$)\nStd: {std_u:.3f} Hz", fontweight="bold")
+    axes[0, 0].set_ylabel("Probability Density")
+    axes[0, 0].set_xlabel("Frequency Offset (Hz)")
+    axes[0, 0].grid(True, linestyle=":", alpha=0.6)
+    axes[0, 0].legend(loc="upper right")
+
+    # FOOOF Signed
+    if len(fooof_signed) > 0:
+        axes[0, 1].hist(fooof_signed, bins=bins, range=(-max_dist_hz, max_dist_hz),
+                        color="forestgreen", edgecolor="black", alpha=0.7, density=True)
+        mean_f, std_f = np.mean(fooof_signed), np.std(fooof_signed)
+        axes[0, 1].axvline(0, color="red", linestyle="--", lw=1.5, label="Zero Bias")
+        axes[0, 1].axvline(mean_f, color="darkorange", lw=1.8, label=f"Mean: {mean_f:+.3f} Hz")
+        axes[0, 1].set_title(f"FOOOF Signed Error ($f_{{pred}} - f_{{gt}}$)\nStd: {std_f:.3f} Hz", fontweight="bold")
+    axes[0, 1].set_ylabel("Probability Density")
+    axes[0, 1].set_xlabel("Frequency Offset (Hz)")
+    axes[0, 1].grid(True, linestyle=":", alpha=0.6)
+    axes[0, 1].legend(loc="upper right")
+
+    # UNet Absolute
+    if len(dl_abs) > 0:
+        axes[1, 0].hist(dl_abs, bins=bins, range=(0, max_dist_hz),
+                        color="royalblue", edgecolor="black", alpha=0.7, density=True)
+        mae_u, med_u = np.mean(dl_abs), np.median(dl_abs)
+        axes[1, 0].axvline(mae_u, color="crimson", lw=1.8, label=f"Mean MAE: {mae_u:.3f} Hz")
+        axes[1, 0].axvline(med_u, color="gold", linestyle="--", lw=1.8, label=f"Median MAE: {med_u:.3f} Hz")
+        axes[1, 0].set_title("UNet Absolute Error Distribution", fontweight="bold")
+    axes[1, 0].set_ylabel("Probability Density")
+    axes[1, 0].set_xlabel("Absolute Error (Hz)")
+    axes[1, 0].grid(True, linestyle=":", alpha=0.6)
+    axes[1, 0].legend(loc="upper right")
+
+    # FOOOF Absolute
+    if len(fooof_abs) > 0:
+        axes[1, 1].hist(fooof_abs, bins=bins, range=(0, max_dist_hz),
+                        color="forestgreen", edgecolor="black", alpha=0.7, density=True)
+        mae_f, med_f = np.mean(fooof_abs), np.median(fooof_abs)
+        axes[1, 1].axvline(mae_f, color="crimson", lw=1.8, label=f"Mean MAE: {mae_f:.3f} Hz")
+        axes[1, 1].axvline(med_f, color="gold", linestyle="--", lw=1.8, label=f"Median MAE: {med_f:.3f} Hz")
+        axes[1, 1].set_title("FOOOF Absolute Error Distribution", fontweight="bold")
+    axes[1, 1].set_ylabel("Probability Density")
+    axes[1, 1].set_xlabel("Absolute Error (Hz)")
+    axes[1, 1].grid(True, linestyle=":", alpha=0.6)
+    axes[1, 1].legend(loc="upper right")
+
+    plt.suptitle("Peak Localization Error Distributions (UNet vs. FOOOF)", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.show()
 
 
 # =====================================================================
-# 3. JOINT BENCHMARK LOOP
+# 2. BENCHMARK EXECUTION
 # =====================================================================
-def run_joint_benchmark(
-    dataset_path,
-    checkpoint_path,
+def run_multinoise_joint_benchmark(
+    model,
+    dataset_path="eeg_psd_multinoise_benchmark_aligned.npz",
+    checkpoint_path="DL_checkpoints/Deformable_UNet(3).pth",
     batch_size=64,
     center_thresh=0.35,
     max_match_dist=2.0,
-    freq_range=None,
+    eval_freq_range=[0.5, 45.0],
     fooof_aperiodic="knee",
     fooof_peak_width=[0.8, 8.0],
     fooof_max_peaks=4,
@@ -211,280 +139,258 @@ def run_joint_benchmark(
     fooof_threshold=2.5,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device} | Checkpoint: {checkpoint_path}")
 
-    # Load neural network
-    model = ResMultiTaskUNet1D(in_channels=1, base_filters=32).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
-    model.load_state_dict(state_dict)
+    # Load Model
+    model.to(device)
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+        model.load_state_dict(state_dict)
+        print(f"Loaded weights from '{checkpoint_path}'")
+    else:
+        print(f"Warning: Checkpoint '{checkpoint_path}' not found! Using initialized weights.")
     model.eval()
 
-    # Load dataset
+    # Load Dataset
     data = np.load(dataset_path, allow_pickle=True)
-    f = data["f"].astype(np.float64)
-    log_noisy = data["log_noisy"]
-    log_clean = data["log_clean"]   # Ground-truth noiseless PSD
-    masks = data["masks"]
+    raw_f = data["f"]
+    # Reconstruct uniform float64 linear grid to guarantee exact step size for FOOOF
+    f = np.linspace(float(raw_f[0]), float(raw_f[-1]), len(raw_f), dtype=np.float64)
 
-    f_fooof = np.linspace(f[0], f[-1], len(f), dtype=np.float64)
-    n_samples = len(log_noisy)
+    k_levels = data["noise_levels_k"]
+    n_levels = len(k_levels)
+    log_noisy_all = data["log_noisy"]  # [N, n_levels, n_freqs]
+    log_clean_all = data["log_clean"]  # [N, n_freqs]
+    masks_all = data["masks"]          # [N, 2, n_freqs]
+    n_samples = len(log_clean_all)
 
-    if freq_range is None:
-        freq_range = [float(f_fooof[0]), float(f_fooof[-1])]
+    # Evaluation slice
+    eval_mask = (f >= eval_freq_range[0]) & (f <= eval_freq_range[1])
+    f_eval = f[eval_mask]
 
-    # Mask for frequency region of interest
-    freq_mask = (f_fooof >= freq_range[0]) & (f_fooof <= freq_range[1])
+    print(f"Grid: [{f[0]:.2f}, {f[-1]:.2f}] Hz ({len(f)} bins)")
+    print(f"Active Evaluation Window: [{eval_freq_range[0]:.2f}, {eval_freq_range[1]:.2f}] Hz")
 
-    print(f"Comparing UNet Model and FOOOF on {n_samples} samples against ground-truth clean PSD...")
+    results = {
+        "dl": {"f1": [], "mae_pos": [], "rmse_recon": []},
+        "fooof": {"f1": [], "mae_pos": [], "rmse_recon": []},
+    }
 
-    fm = FOOOF(
-        aperiodic_mode=fooof_aperiodic,
-        peak_width_limits=fooof_peak_width,
-        max_n_peaks=fooof_max_peaks,
-        min_peak_height=fooof_min_height,
-        peak_threshold=fooof_threshold,
-        verbose=False,
-    )
+    all_dl_abs_errors, all_dl_signed_errors = [], []
+    all_fooof_abs_errors, all_fooof_signed_errors = [], []
 
-    # Peak localization accumulators
-    unet_abs_errors, unet_count_errs = [], []
-    unet_tp, unet_fp, unet_fn = 0, 0, 0
+    sample_vis_idx = 0
+    vis_data = {
+        "f_eval": f_eval,
+        "gt_clean": log_clean_all[sample_vis_idx][eval_mask],
+        "noisy_low": log_noisy_all[sample_vis_idx, 0][eval_mask],
+        "noisy_high": log_noisy_all[sample_vis_idx, -1][eval_mask],
+        "dl_low": None, "dl_high": None, "fooof_low": None, "fooof_high": None,
+    }
 
-    fooof_abs_errors, fooof_count_errs = [], []
-    fooof_tp, fooof_fp, fooof_fn = 0, 0, 0
+    for lvl_idx, k_val in enumerate(k_levels):
+        print(f"\n--- Evaluating Noise Level {lvl_idx + 1}/{n_levels} (Welch K = {k_val}) ---")
 
-    # Reconstruction error accumulators (Curve vs log_clean)
-    unet_spec_mae, unet_spec_rmse = [], []
-    fooof_spec_mae, fooof_spec_rmse = [], []
+        fm = FOOOF(
+            aperiodic_mode=fooof_aperiodic,
+            peak_width_limits=fooof_peak_width,
+            max_n_peaks=fooof_max_peaks,
+            min_peak_height=fooof_min_height,
+            peak_threshold=fooof_threshold,
+            verbose=False,
+        )
 
-    for start_idx in range(0, n_samples, batch_size):
-        end_idx = min(start_idx + batch_size, n_samples)
-        batch_inputs = torch.tensor(log_noisy[start_idx:end_idx], dtype=torch.float32).unsqueeze(1).to(device)
+        dl_tp, dl_fp, dl_fn = 0, 0, 0
+        fooof_tp, fooof_fp, fooof_fn = 0, 0, 0
+        dl_abs_errors, dl_signed_errors = [], []
+        fooof_abs_errors, fooof_signed_errors = [], []
+        dl_spec_rmse, fooof_spec_rmse = [], []
 
-        with torch.no_grad():
-            clean_preds, batch_logits, _ = model(batch_inputs)
-            clean_preds = clean_preds.squeeze(1).cpu().numpy()
+        # 1. Batched UNet Inference directly on identical grid
+        dl_clean_preds = []
+        dl_pred_peaks_list = []
 
-        for i in range(end_idx - start_idx):
-            sample_idx = start_idx + i
+        for start_idx in range(0, n_samples, batch_size):
+            end_idx = min(start_idx + batch_size, n_samples)
+            batch_tensors = (
+                torch.from_numpy(log_noisy_all[start_idx:end_idx, lvl_idx])
+                .unsqueeze(1)
+                .to(device)
+            )
 
-            # ---------------- Target Ground Truth ----------------
-            gt_indices = np.where(masks[sample_idx, 0] > 0.5)[0]
-            gt_f = f_fooof[gt_indices]
-            gt_f = gt_f[(gt_f >= freq_range[0]) & (gt_f <= freq_range[1])]
+            with torch.no_grad():
+                c_preds, batch_logits, _ = model(batch_tensors)
+                dl_clean_preds.extend(c_preds.squeeze(1).cpu().numpy())
 
-            # True clean target spectrum (sliced to freq_range)
-            target_clean_curve = log_clean[sample_idx][freq_mask]
+            for b in range(end_idx - start_idx):
+                p_f = decode_peak_frequencies_subbin(batch_logits[b, 0], f, center_thresh=center_thresh)
+                p_f = p_f[(p_f >= eval_freq_range[0]) & (p_f <= eval_freq_range[1])]
+                dl_pred_peaks_list.append(p_f)
 
-            # ---------------- 1. UNet Prediction ----------------
-            pred_f_unet = decode_peak_frequencies(batch_logits[i, 0], f_fooof, center_thresh=center_thresh)
-            pred_f_unet = pred_f_unet[(pred_f_unet >= freq_range[0]) & (pred_f_unet <= freq_range[1])]
+        # 2. Iterate Samples
+        for i in range(n_samples):
+            # Ground truth peaks
+            gt_indices = np.where(masks_all[i, 0] > 0.5)[0]
+            gt_f = f[gt_indices]
+            gt_f = gt_f[(gt_f >= eval_freq_range[0]) & (gt_f <= eval_freq_range[1])]
+            target_clean_curve = log_clean_all[i][eval_mask]
 
-            u_errs, u_tp, u_fp, u_fn = match_peaks_and_compute_errors(pred_f_unet, gt_f, max_dist_hz=max_match_dist)
-            unet_abs_errors.extend(u_errs)
-            unet_count_errs.append(len(pred_f_unet) - len(gt_f))
-            unet_tp += u_tp
-            unet_fp += u_fp
-            unet_fn += u_fn
+            # UNet Evaluation
+            pred_f_unet = dl_pred_peaks_list[i]
+            u_abs, u_sgn, u_tp, u_fp, u_fn = match_peaks_and_compute_errors(
+                pred_f_unet, gt_f, max_dist_hz=max_match_dist
+            )
+            dl_abs_errors.extend(u_abs)
+            dl_signed_errors.extend(u_sgn)
+            dl_tp += u_tp
+            dl_fp += u_fp
+            dl_fn += u_fn
 
-            # UNet spectral curve reconstruction error
-            unet_curve = clean_preds[i][freq_mask]
-            unet_spec_mae.append(np.mean(np.abs(unet_curve - target_clean_curve)))
-            unet_spec_rmse.append(np.sqrt(np.mean((unet_curve - target_clean_curve) ** 2)))
+            unet_curve_eval = dl_clean_preds[i][eval_mask]
+            dl_spec_rmse.append(np.sqrt(np.mean((unet_curve_eval - target_clean_curve) ** 2)))
 
-            # ---------------- 2. FOOOF Prediction ----------------
-            psd_linear = np.exp(log_noisy[sample_idx]).astype(np.float64)
-            fm.fit(f_fooof, psd_linear, freq_range)
+            # FOOOF Evaluation
+            psd_linear = np.exp(log_noisy_all[i, lvl_idx]).astype(np.float64)
+            fm.fit(f, psd_linear, eval_freq_range)
 
             if fm.has_model and len(fm.peak_params_) > 0:
                 pred_f_fooof = fm.peak_params_[:, 0]
+                pred_f_fooof = pred_f_fooof[(pred_f_fooof >= eval_freq_range[0]) & (pred_f_fooof <= eval_freq_range[1])]
             else:
-                pred_f_fooof = np.array([])
+                pred_f_fooof = np.array([], dtype=np.float64)
 
-            f_errs, f_tp, f_fp, f_fn = match_peaks_and_compute_errors(pred_f_fooof, gt_f, max_dist_hz=max_match_dist)
-            fooof_abs_errors.extend(f_errs)
-            fooof_count_errs.append(len(pred_f_fooof) - len(gt_f))
+            f_abs, f_sgn, f_tp, f_fp, f_fn = match_peaks_and_compute_errors(
+                pred_f_fooof, gt_f, max_dist_hz=max_match_dist
+            )
+            fooof_abs_errors.extend(f_abs)
+            fooof_signed_errors.extend(f_sgn)
             fooof_tp += f_tp
             fooof_fp += f_fp
             fooof_fn += f_fn
 
-            # FOOOF spectral curve reconstruction error
             if fm.has_model:
-                # fm.fooofed_spectrum_ is in log10 space -> convert to natural log
                 fooof_curve_ln = fm.fooofed_spectrum_ * np.log(10.0)
-                fooof_spec_mae.append(np.mean(np.abs(fooof_curve_ln - target_clean_curve)))
                 fooof_spec_rmse.append(np.sqrt(np.mean((fooof_curve_ln - target_clean_curve) ** 2)))
             else:
-                fooof_spec_mae.append(np.nan)
+                fooof_curve_ln = log_noisy_all[i, lvl_idx][eval_mask]
                 fooof_spec_rmse.append(np.nan)
 
-        print(f"Processed samples: {end_idx}/{n_samples}", end="\r")
+            if i == sample_vis_idx:
+                if lvl_idx == 0:
+                    vis_data["dl_low"] = unet_curve_eval
+                    vis_data["fooof_low"] = fooof_curve_ln
+                elif lvl_idx == n_levels - 1:
+                    vis_data["dl_high"] = unet_curve_eval
+                    vis_data["fooof_high"] = fooof_curve_ln
 
-    print("\nProcessing complete.")
+        all_dl_abs_errors.extend(dl_abs_errors)
+        all_dl_signed_errors.extend(dl_signed_errors)
+        all_fooof_abs_errors.extend(fooof_abs_errors)
+        all_fooof_signed_errors.extend(fooof_signed_errors)
 
-    # Peak metrics
-    unet_abs_errors = np.array(unet_abs_errors)
-    fooof_abs_errors = np.array(fooof_abs_errors)
-    unet_count_errs = np.array(unet_count_errs)
-    fooof_count_errs = np.array(fooof_count_errs)
+        # F1 Metrics
+        prec_u = dl_tp / (dl_tp + dl_fp) if (dl_tp + dl_fp) > 0 else 0.0
+        rec_u = dl_tp / (dl_tp + dl_fn) if (dl_tp + dl_fn) > 0 else 0.0
+        f1_u = 2 * prec_u * rec_u / (prec_u + rec_u) if (prec_u + rec_u) > 0 else 0.0
 
-    prec_u = unet_tp / (unet_tp + unet_fp) if (unet_tp + unet_fp) > 0 else 0.0
-    rec_u = unet_tp / (unet_tp + unet_fn) if (unet_tp + unet_fn) > 0 else 0.0
-    f1_u = 2 * prec_u * rec_u / (prec_u + rec_u) if (prec_u + rec_u) > 0 else 0.0
+        prec_f = fooof_tp / (fooof_tp + fooof_fp) if (fooof_tp + fooof_fp) > 0 else 0.0
+        rec_f = fooof_tp / (fooof_tp + fooof_fn) if (fooof_tp + fooof_fn) > 0 else 0.0
+        f1_f = 2 * prec_f * rec_f / (prec_f + rec_f) if (prec_f + rec_f) > 0 else 0.0
 
-    prec_f = fooof_tp / (fooof_tp + fooof_fp) if (fooof_tp + fooof_fp) > 0 else 0.0
-    rec_f = fooof_tp / (fooof_tp + fooof_fn) if (fooof_tp + fooof_fn) > 0 else 0.0
-    f1_f = 2 * prec_f * rec_f / (prec_f + rec_f) if (prec_f + rec_f) > 0 else 0.0
+        results["dl"]["f1"].append(f1_u)
+        results["dl"]["mae_pos"].append(np.mean(dl_abs_errors) if len(dl_abs_errors) > 0 else 0.0)
+        results["dl"]["rmse_recon"].append(np.mean(dl_spec_rmse))
 
-    # Reconstruction metrics across all samples
-    u_mean_mae = np.mean(unet_spec_mae)
-    u_mean_rmse = np.mean(unet_spec_rmse)
-    f_mean_mae = np.nanmean(fooof_spec_mae)
-    f_mean_rmse = np.nanmean(fooof_spec_rmse)
+        results["fooof"]["f1"].append(f1_f)
+        results["fooof"]["mae_pos"].append(np.mean(fooof_abs_errors) if len(fooof_abs_errors) > 0 else 0.0)
+        results["fooof"]["rmse_recon"].append(np.nanmean(fooof_spec_rmse))
 
-    # =====================================================================
-    # 4. PRINT COMPARISON REPORT
-    # =====================================================================
-    print("\n" + "=" * 70)
-    print(f"{'EVALUATION METRIC':<32} | {'UNet MODEL':<16} | {'FOOOF':<16}")
-    print("=" * 70)
-    print("--- 1. PEAK DETECTION & COUNT ---")
-    print(f"{'Precision':<32} | {prec_u:<16.4f} | {prec_f:<16.4f}")
-    print(f"{'Recall':<32} | {rec_u:<16.4f} | {rec_f:<16.4f}")
-    print(f"{'F1 Score':<32} | {f1_u:<16.4f} | {f1_f:<16.4f}")
-    print(f"{'Exact Count Match (%)':<32} | {np.mean(unet_count_errs == 0) * 100:<16.2f} | {np.mean(fooof_count_errs == 0) * 100:<16.2f}")
-    print(f"{'Peak Center MAE (Hz)':<32} | {np.mean(unet_abs_errors):<16.4f} | {np.mean(fooof_abs_errors):<16.4f}")
-    print("--- 2. SPECTRAL CURVE RECONSTRUCTION (vs log_clean) ---")
-    print(f"{'Reconstruction MAE (ln units)':<32} | {u_mean_mae:<16.4f} | {f_mean_mae:<16.4f}")
-    print(f"{'Reconstruction RMSE (ln units)':<32} | {u_mean_rmse:<16.4f} | {f_mean_rmse:<16.4f}")
-    print("=" * 70)
+        print(f"Noise K={k_val:2d} | UNet  -> F1: {f1_u:.3f} | MAE: {results['dl']['mae_pos'][-1]:.3f} Hz | RMSE: {results['dl']['rmse_recon'][-1]:.4f}")
+        print(f"Noise K={k_val:2d} | FOOOF -> F1: {f1_f:.3f} | MAE: {results['fooof']['mae_pos'][-1]:.3f} Hz | RMSE: {results['fooof']['rmse_recon'][-1]:.4f}")
 
-# =====================================================================
-    # 5. COMPREHENSIVE VISUALIZATION (PEAKS + RECONSTRUCTION)
-    # =====================================================================
-    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
+    # Plot summary figures
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.1, 1.0], hspace=0.32, wspace=0.25)
 
-    # -------------------------------------------------------------
-    # ROW 1: PEAK METRICS
-    # -------------------------------------------------------------
-    # 1. Absolute Localization Error Histogram
-    ax = axes[0, 0]
-    bins = np.linspace(0, max_match_dist, 30)
-    if len(unet_abs_errors) > 0:
-        ax.hist(unet_abs_errors, bins=bins, density=True, alpha=0.5, color="royalblue", 
-                label=f"UNet (Mean={np.mean(unet_abs_errors):.2f} Hz)")
-    if len(fooof_abs_errors) > 0:
-        ax.hist(fooof_abs_errors, bins=bins, density=True, alpha=0.5, color="forestgreen", 
-                label=f"FOOOF (Mean={np.mean(fooof_abs_errors):.2f} Hz)")
-    ax.set_title("Peak Absolute Error Distribution")
-    ax.set_xlabel("Absolute Error $|f_{pred} - f_{gt}|$ (Hz)")
-    ax.set_ylabel("Probability Density")
-    ax.grid(True, linestyle=":", alpha=0.5)
-    ax.legend()
+    ax_top1 = fig.add_subplot(gs[0, :2])
+    ax_top1.plot(vis_data["f_eval"], vis_data["noisy_low"], color="silver", lw=1.2, label=f"Noisy Input (K={k_levels[0]})")
+    ax_top1.plot(vis_data["f_eval"], vis_data["gt_clean"], "k--", lw=2.2, label="Analytical Ground Truth")
+    ax_top1.plot(vis_data["f_eval"], vis_data["dl_low"], color="royalblue", lw=1.8, label="UNet Denoised")
+    ax_top1.plot(vis_data["f_eval"], vis_data["fooof_low"], color="forestgreen", linestyle="-.", lw=1.6, label="FOOOF Fit")
+    ax_top1.set_title(f"Reconstruction at Lowest Noise ($K = {k_levels[0]}$)", fontweight="bold")
+    ax_top1.set_xlabel("Frequency (Hz)")
+    ax_top1.set_ylabel("Log Power")
+    ax_top1.grid(True, linestyle=":", alpha=0.5)
+    ax_top1.legend(loc="upper right")
 
-    # 2. Cumulative Distribution Function (CDF)
-    ax = axes[0, 1]
-    if len(unet_abs_errors) > 0:
-        s_u = np.sort(unet_abs_errors)
-        ax.plot(s_u, np.linspace(0, 1, len(s_u)), color="royalblue", lw=2, 
-                label=f"UNet (Median={np.median(unet_abs_errors):.2f} Hz)")
-    if len(fooof_abs_errors) > 0:
-        s_f = np.sort(fooof_abs_errors)
-        ax.plot(s_f, np.linspace(0, 1, len(s_f)), color="forestgreen", lw=2, 
-                label=f"FOOOF (Median={np.median(fooof_abs_errors):.2f} Hz)")
-    ax.set_title("CDF of Absolute Localization Error")
-    ax.set_xlabel("Absolute Error $|f_{pred} - f_{gt}|$ (Hz)")
-    ax.set_ylabel("Cumulative Fraction")
-    ax.grid(True, linestyle=":", alpha=0.5)
-    ax.legend(loc="lower right")
+    ax_top2 = fig.add_subplot(gs[0, 2])
+    ax_top2.plot(vis_data["f_eval"], vis_data["noisy_high"], color="silver", lw=1.0, label=f"Noisy (K={k_levels[-1]})")
+    ax_top2.plot(vis_data["f_eval"], vis_data["gt_clean"], "k--", lw=1.8, label="Ground Truth")
+    ax_top2.plot(vis_data["f_eval"], vis_data["dl_high"], color="royalblue", lw=1.6, label="UNet")
+    ax_top2.plot(vis_data["f_eval"], vis_data["fooof_high"], color="forestgreen", linestyle="-.", lw=1.4, label="FOOOF")
+    ax_top2.set_title(f"Highest Noise ($K = {k_levels[-1]}$)", fontweight="bold")
+    ax_top2.set_xlabel("Frequency (Hz)")
+    ax_top2.grid(True, linestyle=":", alpha=0.5)
+    ax_top2.legend(loc="upper right", fontsize=8)
 
-    # 3. Discrete Peak Count Error (Delta N)
-    ax = axes[0, 2]
-    all_diffs = np.union1d(np.unique(unet_count_errs), np.unique(fooof_count_errs))
-    width = 0.35
-    u_counts = [np.mean(unet_count_errs == d) * 100 for d in all_diffs]
-    f_counts = [np.mean(fooof_count_errs == d) * 100 for d in all_diffs]
+    x_indices = np.arange(n_levels)
+    noise_labels = [f"K={k}\n(L{i+1})" for i, k in enumerate(k_levels)]
 
-    ax.bar(all_diffs - width / 2, u_counts, width=width, color="royalblue", alpha=0.8, 
-           label=f"UNet ({np.mean(unet_count_errs == 0) * 100:.1f}% exact)")
-    ax.bar(all_diffs + width / 2, f_counts, width=width, color="forestgreen", alpha=0.8, 
-           label=f"FOOOF ({np.mean(fooof_count_errs == 0) * 100:.1f}% exact)")
-    ax.set_xticks(all_diffs)
-    ax.set_title("Peak Count Difference ($N_{pred} - N_{gt}$)")
-    ax.set_xlabel("Count Error $\\Delta N$")
-    ax.set_ylabel("Samples (%)")
-    ax.grid(True, linestyle=":", alpha=0.5, axis="y")
-    ax.legend()
+    ax_b1 = fig.add_subplot(gs[1, 0])
+    ax_b1.plot(x_indices, results["dl"]["f1"], "o-", color="royalblue", lw=2, ms=6, label="UNet")
+    ax_b1.plot(x_indices, results["fooof"]["f1"], "s--", color="forestgreen", lw=2, ms=6, label="FOOOF")
+    ax_b1.set_xticks(x_indices)
+    ax_b1.set_xticklabels(noise_labels)
+    ax_b1.set_ylabel("Peak F1 Score")
+    ax_b1.set_title("Peak Detection F1 vs. Noise", fontweight="bold")
+    ax_b1.grid(True, linestyle=":", alpha=0.6)
+    ax_b1.legend()
 
-    # -------------------------------------------------------------
-    # ROW 2: SPECTRAL RECONSTRUCTION (vs log_clean)
-    # -------------------------------------------------------------
-    # 4. Reconstruction MAE Distribution
-    ax = axes[1, 0]
-    ax.hist(unet_spec_mae, bins=25, alpha=0.6, color="royalblue", 
-            label=f"UNet (Mean={u_mean_mae:.3f})")
-    ax.hist(fooof_spec_mae, bins=25, alpha=0.6, color="forestgreen", 
-            label=f"FOOOF (Mean={f_mean_mae:.3f})")
-    ax.set_title("Spectral Reconstruction MAE vs. Clean")
-    ax.set_xlabel("MAE (Natural Log Power)")
-    ax.set_ylabel("Sample Count")
-    ax.grid(True, linestyle=":", alpha=0.5)
-    ax.legend()
+    ax_b2 = fig.add_subplot(gs[1, 1])
+    ax_b2.plot(x_indices, results["dl"]["mae_pos"], "o-", color="royalblue", lw=2, ms=6, label="UNet")
+    ax_b2.plot(x_indices, results["fooof"]["mae_pos"], "s--", color="forestgreen", lw=2, ms=6, label="FOOOF")
+    ax_b2.set_xticks(x_indices)
+    ax_b2.set_xticklabels(noise_labels)
+    ax_b2.set_ylabel("Localization MAE (Hz)")
+    ax_b2.set_title("Peak Localization MAE vs. Noise", fontweight="bold")
+    ax_b2.grid(True, linestyle=":", alpha=0.6)
+    ax_b2.legend()
 
-    # 5. Reconstruction RMSE Distribution
-    ax = axes[1, 1]
-    ax.hist(unet_spec_rmse, bins=25, alpha=0.6, color="royalblue", 
-            label=f"UNet (Mean={u_mean_rmse:.3f})")
-    ax.hist(fooof_spec_rmse, bins=25, alpha=0.6, color="forestgreen", 
-            label=f"FOOOF (Mean={f_mean_rmse:.3f})")
-    ax.set_title("Spectral Reconstruction RMSE vs. Clean")
-    ax.set_xlabel("RMSE (Natural Log Power)")
-    ax.set_ylabel("Sample Count")
-    ax.grid(True, linestyle=":", alpha=0.5)
-    ax.legend()
-
-    # 6. Single-Sample Spectrum Reconstruction Overlay
-    ax = axes[1, 2]
-    ax.plot(f_fooof[freq_mask], target_clean_curve, color="black", lw=2, label="Target Clean")
-    ax.plot(f_fooof[freq_mask], unet_curve, color="royalblue", linestyle="--", label="UNet Denoised")
-    if fm.has_model:
-        ax.plot(f_fooof[freq_mask], fooof_curve_ln, color="forestgreen", linestyle=":", label="FOOOF Fit")
-    ax.set_title("Single-Sample Fit Comparison")
-    ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Natural Log Power")
-    ax.grid(True, linestyle=":", alpha=0.5)
-    ax.legend()
+    ax_b3 = fig.add_subplot(gs[1, 2])
+    ax_b3.plot(x_indices, results["dl"]["rmse_recon"], "o-", color="royalblue", lw=2, ms=6, label="UNet")
+    ax_b3.plot(x_indices, results["fooof"]["rmse_recon"], "s--", color="forestgreen", lw=2, ms=6, label="FOOOF")
+    ax_b3.set_xticks(x_indices)
+    ax_b3.set_xticklabels(noise_labels)
+    ax_b3.set_ylabel("Reconstruction RMSE (ln units)")
+    ax_b3.set_title("Continuous PSD Reconstruction RMSE", fontweight="bold")
+    ax_b3.grid(True, linestyle=":", alpha=0.6)
+    ax_b3.legend()
 
     plt.tight_layout()
     plt.show()
 
+    plot_head_to_head_error_distributions(
+        all_dl_abs_errors, all_dl_signed_errors,
+        all_fooof_abs_errors, all_fooof_signed_errors,
+        max_dist_hz=max_match_dist, bins=40,
+    )
+
 
 if __name__ == "__main__":
-    run_joint_benchmark(
-        dataset_path="eeg_psd_benchmark_fooof_advantage.npz",
-        checkpoint_path="best_keypoint_se_cascade.pth",
+    unet_model = DeformResMultiTaskUNet1D(in_channels=1, base_filters=32)
+
+    run_multinoise_joint_benchmark(
+        model=unet_model,
+        dataset_path="eeg_psd_multinoise_benchmark_aligned.npz",
+        checkpoint_path="DL_checkpoints/Deformable_UNet(3).pth",
         batch_size=64,
         center_thresh=0.35,
         max_match_dist=2.0,
-        freq_range=[0.5, 45.0],
+        eval_freq_range=[0.5, 45.0],
         fooof_aperiodic="knee",
         fooof_peak_width=[0.8, 8.0],
         fooof_max_peaks=4,
         fooof_min_height=0.25,
         fooof_threshold=2.5,
-    )
-
-
-if __name__ == "__main__":
-    run_joint_benchmark(
-        dataset_path="eeg_psd_benchmark.npz",
-        checkpoint_path="best_keypoint_se_cascade.pth",
-        batch_size=64,
-        center_thresh=0.35,
-        max_match_dist=2.0,
-        freq_range=[0.5, 45.0],
-        fooof_aperiodic="knee",
-        fooof_peak_width=[0.5, 12.0],
-        fooof_max_peaks=6,
-        fooof_min_height=0.1,
     )
